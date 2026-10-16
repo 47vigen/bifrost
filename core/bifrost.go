@@ -5571,15 +5571,18 @@ func (bifrost *Bifrost) getProviderByKey(providerKey schemas.ModelProvider) sche
 
 // shouldTryFallbacks handles the primary error and returns true if we should proceed with fallbacks, false if we should return immediately
 //
-// A chain Bifrost inferred on its own (Fallback.Inferred, set by the model-catalog resolver
-// when it promotes every other provider serving a bare model) does not run after a primary
-// error classed as FailureClassCallerFault: a 400/409/413/415/422 with a provider error body,
-// or a 404 naming a request field. That error says the request itself is malformed, so the
-// caller gets it back instead of an answer from a provider nobody asked for. A model this
-// provider cannot reach (FailureClassModelAccess, e.g. 404 model_not_found), a rejected key,
-// a rate limit, a 5xx or a network failure still falls back, since another provider can
-// succeed. Chains the caller or a routing config named keep falling back on any error.
-// The extra cost is one bool load on the first fallback, and classification only on that path.
+// No chain runs after a primary error classed as FailureClassCallerFault: a 400/409/413/415/422
+// with a provider error body, or a 404 naming a request field. That error says the request itself
+// is malformed, so the caller gets it back instead of an answer from another model, whether the
+// chain was inferred (Fallback.Inferred, set by the model-catalog resolver) or named by the caller
+// or a routing config. The classifier checks rate-limit, region, credential and model-access
+// signals first, so a 400 that names one of those is not a caller fault: a model this provider
+// cannot reach (FailureClassModelAccess, e.g. 404 model_not_found), a region block, a rejected
+// key, a rate limit, a 5xx or a network failure still falls back, since another provider can
+// succeed. Bifrost's own refusal to build a key pool for the primary (NoKeySupportsModel, e.g. a
+// key pin naming another provider's key) is not the provider refusing the request, so a named
+// chain still falls back past it; an inferred chain stops there as it always has. Classification
+// runs only on a failed primary with a chain.
 func (bifrost *Bifrost) shouldTryFallbacks(ctx *schemas.BifrostContext, req *schemas.BifrostRequest, primaryErr *schemas.BifrostError) bool {
 	// If no primary error, we succeeded
 	if primaryErr == nil {
@@ -5607,16 +5610,23 @@ func (bifrost *Bifrost) shouldTryFallbacks(ctx *schemas.BifrostContext, req *sch
 		return false
 	}
 
-	if fallbacks[0].Inferred && ClassifyFailure(primaryErr) == schemas.FailureClassCallerFault {
-		bifrost.logger.Debug("primary refused the request itself, not trying %d inferred fallbacks", len(fallbacks))
+	if ClassifyFailure(primaryErr) == schemas.FailureClassCallerFault && (fallbacks[0].Inferred || !isKeyPoolRefusal(primaryErr)) {
+		bifrost.logger.Debug("primary refused the request itself, not trying %d fallbacks", len(fallbacks))
 		if ctx != nil {
-			ctx.AppendRoutingEngineLog(schemas.RoutingEngineCore, schemas.LogLevelInfo, fmt.Sprintf("Primary refused the request itself (%s); skipping %d model-catalog fallback(s) the caller did not name", routingErrorSummary(primaryErr), len(fallbacks)))
+			ctx.AppendRoutingEngineLog(schemas.RoutingEngineCore, schemas.LogLevelInfo, fmt.Sprintf("Primary refused the request itself (%s); skipping %d fallback(s)", routingErrorSummary(primaryErr), len(fallbacks)))
 		}
 		return false
 	}
 
 	// Should proceed with fallbacks
 	return true
+}
+
+// isKeyPoolRefusal reports whether err is Bifrost's own refusal to find a key for the primary rather
+// than a provider's answer.
+func isKeyPoolRefusal(err *schemas.BifrostError) bool {
+	return (err.Type != nil && *err.Type == schemas.NoKeySupportsModel) ||
+		err.ExtraFields.ErrorType == schemas.ErrorTypeCallerModelNotAvailable
 }
 
 // prepareFallbackRequest creates a fallback request and validates the provider config
